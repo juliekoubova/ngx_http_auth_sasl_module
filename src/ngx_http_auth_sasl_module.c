@@ -1,9 +1,8 @@
-/**
+/*
  * Copyright (C) 2014 Julie Koubova <juliekoubova@icloud.com>
  *
- * Based on 'ngx_http_auth_basic_module.c' by Igor Sysoev and
- * 'ngx_http_auth_pam_module.c' by Sergio Talens-Oliag.
- *
+ * Based on ngx_http_auth_basic_module by Igor Sysoev and
+ * ngx_http_auth_pam_module by Sergio Talens-Oliag.
  */
 
 #include <ngx_config.h>
@@ -67,6 +66,9 @@ static char* ngx_http_auth_sasl_errorcodes[] = {
     "SASL_BADBINDING"         /* -32 */
 };
 
+/*
+ * Covnerts a SASL return code into its textual form.
+ */
 static const char*
 ngx_http_auth_sasl_errorcode_toa(int saslrc)
 {
@@ -77,10 +79,10 @@ ngx_http_auth_sasl_errorcode_toa(int saslrc)
     return ngx_http_auth_sasl_errorcodes[2 - saslrc];
 }
 
-/* ========================================================================================
- * SASL Callbacks
- * ======================================================================================== */
-
+/*
+ * Logs a successful SASL return codes as a NGX_LOG_DEBUG,
+ * errors as NGX_LOG_ERR.
+ */
 static void
 ngx_http_auth_sasl_log_sasl_result(
         ngx_http_request_t *r,
@@ -102,6 +104,10 @@ ngx_http_auth_sasl_log_sasl_result(
     }
 }
 
+/* ========================================================================================
+ * SASL Callbacks
+ * ======================================================================================== */
+
 static int
 ngx_http_auth_sasl_getopt_cb(
     void        *context,
@@ -110,6 +116,7 @@ ngx_http_auth_sasl_getopt_cb(
     const char **result,
     unsigned    *len)
 {
+    /* TODO: Make this configurable. */
     static const char     PWCHECK_METHOD[] = "pwcheck_method";
     static const char     SASLAUTHD[]      = "saslauthd";
     static const unsigned SASLAUTHD_LEN    = sizeof(SASLAUTHD) - 1;
@@ -146,10 +153,8 @@ ngx_http_auth_sasl_checkpass(
         ngx_str_t          *password)
 {
 
-    /*
-     * Define a getopt callback so that SASL asks us for configuration.
-     * Pass the current request as context.
-     */
+    /* Define a getopt callback so that SASL asks us for configuration.
+     * Pass the current request as context. */
     sasl_callback_t ngx_http_auth_sasl_callbacks[] = {
         {
             SASL_CB_GETOPT,                              /* id */
@@ -164,16 +169,27 @@ ngx_http_auth_sasl_checkpass(
     ngx_int_t    ngxrc    = NGX_ERROR;
     int          saslrc   = SASL_FAIL;
 
+    /* Initialize the SASL global state.
+     * TODO: Don't do this on every request.
+     * TODO: Make app name configurable. */
+
     saslrc = sasl_server_init(
             ngx_http_auth_sasl_callbacks,
             "nginx");
-    ngx_http_auth_sasl_log_sasl_result(r, "sasl_server_init", saslrc);
+
+    ngx_http_auth_sasl_log_sasl_result(
+            r,
+            "sasl_server_init",
+            saslrc);
 
     if (saslrc != SASL_OK) {
         ngxrc = NGX_ERROR;
         goto cleanup;
     }
 
+    /* Initialize the SASL connection state.
+     * TODO: Provide SASL with all the client info.
+     * TODO: Make service name configurable. */
     saslrc = sasl_server_new("nginx", /* Registered name of service */
                              NULL,    /* my fully qualified domain name; NULL says use gethostname() */
                              NULL,    /* The user realm used for password lookups; NULL means default to serverFQDN Note: This does not affect Kerberos */
@@ -183,20 +199,27 @@ ngx_http_auth_sasl_checkpass(
                              0,       /* security flags (security layers are enabled using security properties, separately) */
                              &conn);
 
-    ngx_http_auth_sasl_log_sasl_result(r, "sasl_server_new", saslrc);
+    ngx_http_auth_sasl_log_sasl_result(
+            r,
+            "sasl_server_new",
+            saslrc);
 
     if (saslrc != SASL_OK) {
         ngxrc = NGX_ERROR;
         goto cleanup;
     }
 
+    /* Check the password! */
     saslrc = sasl_checkpass(conn,
                             (char*)user->data,
                             user->len,
                             (char*)password->data,
                             password->len);
 
-    ngx_http_auth_sasl_log_sasl_result(r, "sasl_server_checkpass", saslrc);
+    ngx_http_auth_sasl_log_sasl_result(
+            r,
+            "sasl_server_checkpass",
+            saslrc);
 
     switch (saslrc) {
 
@@ -252,6 +275,10 @@ ngx_http_auth_sasl_unauthorized(ngx_http_request_t *r, const ngx_str_t *realm)
     return NGX_HTTP_UNAUTHORIZED;
 }
 
+/*
+ * Parses the username:password string provided by ngx_http_auth_basic_user
+ * and calls ngx_http_auth_sasl_checkpass to validate the credentials.
+ */
 static ngx_int_t
 ngx_http_auth_sasl_authenticate(
         ngx_http_request_t            *r,
@@ -283,21 +310,23 @@ ngx_http_auth_sasl_authenticate(
         return ngx_http_auth_sasl_unauthorized(r, &lcf->realm);
     }
 
-    return NGX_OK;
+    return rc;
 }
 
+/*
+ * The request access phase handler. Uses ngx_http_auth_basic_user to decode the
+ * credentials, then calls ngx_http_auth_sasl_authenticate to process them further.
+ */
 static ngx_int_t
 ngx_http_auth_sasl_handler(ngx_http_request_t *r)
 {
-    ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "SASL HANDLER");
-
     ngx_http_auth_sasl_loc_conf_t  *lcf;
     ngx_int_t                       rc;
 
     lcf = ngx_http_get_module_loc_conf(r, ngx_http_auth_sasl_module);
 
-    ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-            "SASL HANDLER REALM: %s", lcf->realm.data);
+    ngx_log_error(NGX_LOG_DEBUG, r->connection->log, 0,
+            "ngx_http_auth_sasl_handler: realm:%s", lcf->realm.data);
 
     if (lcf->realm.len == 0) {
         /* SASL authentication is not enabled at this location. */
@@ -309,7 +338,7 @@ ngx_http_auth_sasl_handler(ngx_http_request_t *r)
     rc = ngx_http_auth_basic_user(r);
 
     if (rc == NGX_DECLINED) {
-        /* No HTTP authentication header provided by the browser.
+        /* No HTTP authentication header provided by the client.
          * Set realm and return HTTP Unauthorized. */
         return ngx_http_auth_sasl_unauthorized(r, &lcf->realm);
     }
