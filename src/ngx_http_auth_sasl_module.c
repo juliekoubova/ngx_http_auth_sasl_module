@@ -10,6 +10,8 @@
 #include <ngx_core.h>
 #include <ngx_http.h>
 
+#include <sasl/sasl.h>
+
 /*
  * Our per-location configuration.
  */
@@ -24,7 +26,207 @@ typedef struct {
 ngx_module_t ngx_http_auth_sasl_module;
 
 /* ========================================================================================
- * Access Handler
+ * SASL Error Codes
+ * ======================================================================================== */
+
+static char* ngx_http_auth_sasl_errorcodes[] = {
+    "SASL_INTERACT",          /*  2  */
+    "SASL_CONTINUE",          /*  1  */
+    "SASL_OK",                /*  0  */
+    "SASL_FAIL",              /* -1  */
+    "SASL_NOMEM",             /* -2  */
+    "SASL_BUFOVER",           /* -3  */
+    "SASL_NOMECH",            /* -4  */
+    "SASL_BADPROT",           /* -5  */
+    "SASL_NOTDONE",           /* -6  */
+    "SASL_BADPARAM",          /* -7  */
+    "SASL_TRYAGAIN",          /* -8  */
+    "SASL_BADMAC",            /* -9  */
+    "SASL_BADSERV",           /* -10 */
+    "SASL_WRONGMECH",         /* -11 */
+    "SASL_NOTINIT",           /* -12 */
+    "SASL_BADAUTH",           /* -13 */
+    "SASL_NOAUTHZ",           /* -14 */
+    "SASL_TOOWEAK",           /* -15 */
+    "SASL_ENCRYPT",           /* -16 */
+    "SASL_TRANS",             /* -17 */
+    "SASL_EXPIRED",           /* -18 */
+    "SASL_DISABLED",          /* -19 */
+    "SASL_NOUSER",            /* -20 */
+    "SASL_PWLOCK",            /* -21 */
+    "SASL_NOCHANGE",          /* -22 */
+    "SASL_BADVERS",           /* -23 */
+    "SASL_UNAVAIL",           /* -24 */
+    NULL,                     /* -25 */
+    "SASL_NOVERIFY",          /* -26 */
+    "SASL_WEAKPASS",          /* -27 */
+    "SASL_NOUSERPASS",        /* -28 */
+    "SASL_NEED_OLD_PASSWD",   /* -29 */
+    "SASL_CONSTRAINT_VIOLAT", /* -30 */
+    NULL,                     /* -31 */
+    "SASL_BADBINDING"         /* -32 */
+};
+
+static const char*
+ngx_http_auth_sasl_errorcode_toa(int saslrc)
+{
+    if (saslrc < -32 || saslrc > 2) {
+        return NULL;
+    }
+
+    return ngx_http_auth_sasl_errorcodes[2 - saslrc];
+}
+
+/* ========================================================================================
+ * SASL Callbacks
+ * ======================================================================================== */
+
+static void
+ngx_http_auth_sasl_log_sasl_result(
+        ngx_http_request_t *r,
+        const char         *message,
+        int                 saslrc)
+{
+    const char *saslrc_str;
+    ngx_uint_t  log_level;
+
+    saslrc_str = ngx_http_auth_sasl_errorcode_toa(saslrc);
+    log_level  = (saslrc >= 0) ? NGX_LOG_DEBUG : NGX_LOG_ERR;
+
+    if (saslrc_str == NULL) {
+        ngx_log_error(log_level, r->connection->log, 0,
+                "%s: unknown SASL result %d", message, saslrc);
+    } else {
+        ngx_log_error(log_level, r->connection->log, 0,
+                "%s: %s", message, saslrc_str);
+    }
+}
+
+static int
+ngx_http_auth_sasl_getopt_cb(
+    void        *context,
+    const char  *plugin_name,
+    const char  *option,
+    const char **result,
+    unsigned    *len)
+{
+    static const char     PWCHECK_METHOD[] = "pwcheck_method";
+    static const char     SASLAUTHD[]      = "saslauthd";
+    static const unsigned SASLAUTHD_LEN    = sizeof(SASLAUTHD) - 1;
+
+    ngx_http_request_t *r        = context;
+    unsigned            mylen    = 0;
+
+    if (plugin_name == NULL) {
+        plugin_name = "(null)";
+
+        if (ngx_strcmp(PWCHECK_METHOD, option) == 0) {
+            *result  = SASLAUTHD;
+            mylen    = SASLAUTHD_LEN;
+        }
+    }
+
+    if (r != NULL) {
+        ngx_log_error(NGX_LOG_DEBUG, r->connection->log, 0,
+                "ngx_http_auth_sasl_getopt_cb plugin_name:%s option:%s result:%s",
+                plugin_name, option, (mylen ? *result : ""));
+    }
+
+    if (len != NULL) {
+        *len = mylen;
+    }
+
+    return SASL_OK;
+}
+
+static ngx_int_t
+ngx_http_auth_sasl_checkpass(
+        ngx_http_request_t *r,
+        ngx_str_t          *user,
+        ngx_str_t          *password)
+{
+
+    /*
+     * Define a getopt callback so that SASL asks us for configuration.
+     * Pass the current request as context.
+     */
+    sasl_callback_t ngx_http_auth_sasl_callbacks[] = {
+        {
+            SASL_CB_GETOPT,                              /* id */
+            (int (*)(void))ngx_http_auth_sasl_getopt_cb, /* proc */
+            r                                            /* context */
+        },
+
+        { SASL_CB_LIST_END, NULL, NULL }
+    };
+
+    sasl_conn_t *conn     = NULL;
+    ngx_int_t    ngxrc    = NGX_ERROR;
+    int          saslrc   = SASL_FAIL;
+
+    saslrc = sasl_server_init(
+            ngx_http_auth_sasl_callbacks,
+            "nginx");
+    ngx_http_auth_sasl_log_sasl_result(r, "sasl_server_init", saslrc);
+
+    if (saslrc != SASL_OK) {
+        ngxrc = NGX_ERROR;
+        goto cleanup;
+    }
+
+    saslrc = sasl_server_new("nginx", /* Registered name of service */
+                             NULL,    /* my fully qualified domain name; NULL says use gethostname() */
+                             NULL,    /* The user realm used for password lookups; NULL means default to serverFQDN Note: This does not affect Kerberos */
+                             NULL,    /* local IP address and port */
+                             NULL,    /* remote IP address and port */
+                             NULL,    /* Callbacks supported only for this connection */
+                             0,       /* security flags (security layers are enabled using security properties, separately) */
+                             &conn);
+
+    ngx_http_auth_sasl_log_sasl_result(r, "sasl_server_new", saslrc);
+
+    if (saslrc != SASL_OK) {
+        ngxrc = NGX_ERROR;
+        goto cleanup;
+    }
+
+    saslrc = sasl_checkpass(conn,
+                            (char*)user->data,
+                            user->len,
+                            (char*)password->data,
+                            password->len);
+
+    ngx_http_auth_sasl_log_sasl_result(r, "sasl_server_checkpass", saslrc);
+
+    switch (saslrc) {
+
+    case SASL_OK:
+        ngxrc = NGX_OK;
+        break;
+
+    case SASL_BADAUTH:
+        ngxrc = NGX_DECLINED;
+        break;
+
+    default:
+        ngxrc = NGX_ERROR;
+        break;
+    }
+
+cleanup:
+
+    if (conn != NULL) {
+        sasl_dispose(&conn);
+    }
+
+    saslrc = sasl_server_done();
+    ngx_http_auth_sasl_log_sasl_result(r, "sasl_server_done", saslrc);
+
+    return ngxrc;
+}
+
+/* ========================================================================================
+ * NGINX Access Handler
  * ======================================================================================== */
 
 /*
@@ -34,7 +236,7 @@ ngx_module_t ngx_http_auth_sasl_module;
 static ngx_int_t
 ngx_http_auth_sasl_unauthorized(ngx_http_request_t *r, const ngx_str_t *realm)
 {
-    static const char   HEADER_NAME[]   = "WWW-Authenticate";
+    static const u_char HEADER_NAME[]   = "WWW-Authenticate";
     static const size_t HEADER_NAME_LEN = sizeof(HEADER_NAME) - 1;
 
     r->headers_out.www_authenticate = ngx_list_push(&r->headers_out.headers);
@@ -42,12 +244,46 @@ ngx_http_auth_sasl_unauthorized(ngx_http_request_t *r, const ngx_str_t *realm)
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
     }
 
-    r->headers_out.www_authenticate->hash = 1;
-    r->headers_out.www_authenticate->key.len = HEADER_NAME_LEN;
-    r->headers_out.www_authenticate->key.data = HEADER_NAME;
-    r->headers_out.www_authenticate->value = *realm;
+    r->headers_out.www_authenticate->hash     = 1;
+    r->headers_out.www_authenticate->key.len  = HEADER_NAME_LEN;
+    r->headers_out.www_authenticate->key.data = (u_char*)HEADER_NAME;
+    r->headers_out.www_authenticate->value    = *realm;
 
     return NGX_HTTP_UNAUTHORIZED;
+}
+
+static ngx_int_t
+ngx_http_auth_sasl_authenticate(
+        ngx_http_request_t            *r,
+        ngx_http_auth_sasl_loc_conf_t *lcf)
+{
+    ngx_str_t  user = { 0, NULL };
+    ngx_int_t  rc;
+    u_char    *p;
+
+    /* The user field contains "username:password"
+     * Let's find where the username ends. */
+    for (user.len = 0; user.len < r->headers_in.user.len; user.len++) {
+        if (r->headers_in.user.data[user.len] == ':') {
+            break;
+        }
+    }
+
+    user.data = ngx_palloc(r->pool, user.len + 1);
+    if (user.data == NULL) {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+     p = ngx_cpymem(user.data, r->headers_in.user.data, user.len);
+    *p = '\0';
+
+    rc = ngx_http_auth_sasl_checkpass(r, &user, &r->headers_in.passwd);
+
+    if (rc == NGX_DECLINED) {
+        return ngx_http_auth_sasl_unauthorized(r, &lcf->realm);
+    }
+
+    return NGX_OK;
 }
 
 static ngx_int_t
@@ -78,7 +314,7 @@ ngx_http_auth_sasl_handler(ngx_http_request_t *r)
         return ngx_http_auth_sasl_unauthorized(r, &lcf->realm);
     }
 
-    return NGX_OK;
+    return ngx_http_auth_sasl_authenticate(r, lcf);
 }
 
 /* ========================================================================================
@@ -86,7 +322,7 @@ ngx_http_auth_sasl_handler(ngx_http_request_t *r)
  * ======================================================================================== */
 
 /*
- * Registers our request access phase handler.
+ * Register our request access phase handler.
  */
 static ngx_int_t
 ngx_http_auth_sasl_init(ngx_conf_t *cf)
@@ -102,6 +338,7 @@ ngx_http_auth_sasl_init(ngx_conf_t *cf)
     }
 
     *h = ngx_http_auth_sasl_handler;
+
     return NGX_OK;
 }
 
@@ -139,9 +376,9 @@ ngx_http_auth_sasl_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
 
 /*
  * Wraps the realm name with "Basic realm=\"<data>\"", so the value
- * doesn't need any further processing before sending to the client.
+ * doesn't need any further processing before being sent to the client.
  * If the realm name equals "off", the value is discarded, and
- * SASL authentication is disabled at this location.
+ * SASL authentication is disabled at the location.
  */
 static char *
 ngx_http_auth_sasl_post_handler(ngx_conf_t *cf, void *post, void *data)
@@ -236,88 +473,3 @@ ngx_module_t ngx_http_auth_sasl_module = {
     NULL,                                 /* exit master */
     NGX_MODULE_V1_PADDING
 };
-
-
-
-#if 0
-#include <sasl/sasl.h>
-#include <stdio.h>
-#include <string.h>
-
-int
-main(int argc, char* argv[])
-{
-    int          rc       = 0;
-    char         user[]   = "julie";
-    char         passwd[] = "1234";
-    sasl_conn_t *conn     = NULL;
-
-    rc = sasl_server_init(
-            ngx_http_auth_sasl_callbacks,
-            "nginx");
-
-    if (rc != SASL_OK) {
-        printf("sasl_server_init failed, rc=%d\n", rc);
-        return rc;
-    }
-
-    rc = sasl_server_new("nginx", /* Registered name of service */
-                         NULL,   /* my fully qualified domain name; NULL says use gethostname() */
-                         NULL,   /* The user realm used for password lookups; NULL means default to serverFQDN Note: This does not affect Kerberos */
-                         NULL,
-                         NULL,    /* IP Address information strings */
-                         NULL,    /* Callbacks supported only for this connection */
-                         0,       /* security flags (security layers are enabled using security properties, separately) */
-                         &conn);
-
-    if (rc != SASL_OK) {
-        printf("sasl_server_new failed, rc=%d\n", rc);
-        return rc;
-    }
-
-    rc = sasl_checkpass(conn,
-                        user, 0,
-                        passwd, 0);
-
-    printf("rc=%d\n", rc);
-    return rc;
-}
-
-static int
-ngx_http_auth_sasl_getopt_cb(
-    void        *context,
-    const char  *plugin_name,
-    const char  *option,
-    cons t char **result,
-    unsigned    *len)
-{
-    printf("getopt_cb:\n  plugin_name=%s\n  option=%s\n", plugin_name, option);
-
-    if (plugin_name == NULL) {
-        if(strcmp("pwcheck_method", option) == 0) {
-            printf("set saslauthd\n");
-            *result = "saslauthd";
-            if (len) {
-                *len = strlen(*result);
-            }
-            return SASL_OK;
-        }
-    }
-
-    return SASL_FAIL;
-}
-
-/*
- * Define a getopt callback so that SASL asks us for
- * configuration.
- */
-static sasl_callback_t ngx_http_auth_sasl_callbacks[] = {
-    {
-        SASL_CB_GETOPT,                              /* id */
-        (int (*)(void))ngx_http_auth_sasl_getopt_cb, /* proc */
-        NULL                                         /* context */
-    },
-
-    { SASL_CB_LIST_END, NULL, NULL }
-};
-#endif
